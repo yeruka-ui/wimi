@@ -22,6 +22,22 @@ def _in_ignored_dir(path, ignore_dirs):
     return any(d in parts for d in ignore_dirs)
 
 
+def _in_included_dir(path, vault, include_dirs):
+    """Empty include_dirs = include everything. Otherwise the file's
+    vault-relative top-level folder must match (case-insensitive)."""
+    if not include_dirs:
+        return True
+    try:
+        rel = Path(path).resolve().relative_to(Path(vault).resolve())
+    except ValueError:
+        return False
+    if not rel.parts or len(rel.parts) < 2:
+        # File sits directly in the vault root — not under any folder.
+        return False
+    top = rel.parts[0].lower()
+    return any(top == d.lower() for d in include_dirs)
+
+
 class _Debouncer:
     """Coalesces bursty events per-path into a single delayed callback."""
 
@@ -65,7 +81,11 @@ class Handler(FileSystemEventHandler):
             self.proc.handle_move(paths[0], paths[1])
 
     def _accept(self, path):
-        return _is_markdown(path) and not _in_ignored_dir(path, self.cfg["ignore_dirs"])
+        return (
+            _is_markdown(path)
+            and not _in_ignored_dir(path, self.cfg["ignore_dirs"])
+            and _in_included_dir(path, self.cfg["vault_path"], self.cfg.get("include_dirs", []))
+        )
 
     def on_created(self, event):
         if event.is_directory or not self._accept(event.src_path):
@@ -101,6 +121,8 @@ def initial_scan(cfg, processor):
     count = 0
     for p in vault.rglob("*.md"):
         if _in_ignored_dir(p, cfg["ignore_dirs"]):
+            continue
+        if not _in_included_dir(p, cfg["vault_path"], cfg.get("include_dirs", [])):
             continue
         try:
             processor.handle_upsert(str(p))
