@@ -74,6 +74,52 @@ class App:
         self._tail_thread = threading.Thread(target=self._tail_log, daemon=True)
         self._tail_thread.start()
 
+        # Auto-stop watcher when the window closes.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Auto-start watcher on launch unless disabled in config.
+        if self.cfg.get("auto_start_watcher", True):
+            self.root.after(500, self._ensure_ollama_then_start)
+
+    def _ensure_ollama_then_start(self):
+        # Best-effort: launch the Ollama tray app if the server isn't reachable.
+        if not self._ollama_up():
+            self._try_launch_ollama()
+            # Give it a few seconds to come up; retry once.
+            self.root.after(4000, self._start)
+            return
+        self._start()
+
+    def _ollama_up(self):
+        try:
+            import urllib.request
+            url = self.cfg.get("ollama_url", "http://localhost:11434").rstrip("/") + "/api/tags"
+            with urllib.request.urlopen(url, timeout=1.5) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def _try_launch_ollama(self):
+        candidates = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama app.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe",
+        ]
+        for exe in candidates:
+            if exe.exists():
+                try:
+                    subprocess.Popen([str(exe)], creationflags=subprocess.DETACHED_PROCESS if os.name == "nt" else 0)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    def _on_close(self):
+        try:
+            if self.proc and self.proc.poll() is None:
+                self._stop()
+        finally:
+            self.root.destroy()
+
     # --- UI construction ---------------------------------------------------
 
     def _build_ui(self):

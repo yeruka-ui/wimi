@@ -9,6 +9,7 @@
   "write_uid_to_vault": true,
   "max_section_chars": 6000,
   "include_dirs": [],
+  "auto_start_watcher": true,
   "ignore_dirs": [
     ".obsidian",
     ".trash",
