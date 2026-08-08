@@ -16,7 +16,15 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-HERE = Path(__file__).resolve().parent
+
+def _app_dir():
+    """Directory containing config.json / logs — differs when frozen by PyInstaller."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+HERE = _app_dir()
 CONFIG_PATH = HERE / "config.json"
 LOG_PATH = HERE / "logs" / "pipeline.log"
 
@@ -169,8 +177,12 @@ class App:
         # Save first so the watcher picks up the current selection.
         self._save_selection()
         try:
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--watcher"]
+            else:
+                cmd = [sys.executable, str(HERE / "watcher.py")]
             self.proc = subprocess.Popen(
-                [sys.executable, str(HERE / "watcher.py")],
+                cmd,
                 cwd=str(HERE),
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
@@ -236,8 +248,13 @@ class App:
 
 
 def main():
+    # Dual-mode entry point: --watcher runs the watcher process, otherwise the GUI.
+    if "--watcher" in sys.argv[1:]:
+        import watcher  # local import so PyInstaller sees the dep
+        watcher.main()
+        return
     root = tk.Tk()
-    app = App(root)
+    App(root)
     root.mainloop()
 
 
