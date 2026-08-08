@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Pipeline runtime data (regenerated on every run)
+obsidian-anki-pipeline/state.json
+obsidian-anki-pipeline/cards.json
+obsidian-anki-pipeline/deck.apkg
+obsidian-anki-pipeline/logs/
+
+# Local config (contains machine-specific vault path)
+obsidian-anki-pipeline/config.json
+
+# OS
+.DS_Store
+Thumbs.db
