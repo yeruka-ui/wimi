@@ -1,0 +1,17 @@
+{
+  "vault_path": "C:/path/to/your/Obsidian Vault",
+  "output_dir": "./",
+  "deck_root_name": "Obsidian",
+  "ollama_url": "http://localhost:11434",
+  "ollama_model": "llama3.2:3b",
+  "ollama_timeout_seconds": 120,
+  "debounce_seconds": 1.5,
+  "write_uid_to_vault": true,
+  "max_section_chars": 6000,
+  "ignore_dirs": [
+    ".obsidian",
+    ".trash",
+    ".git",
+    "node_modules"
+  ]
+}

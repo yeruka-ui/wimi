@@ -1,0 +1,5 @@
+watchdog>=4.0
+requests>=2.31
+genanki>=0.13
+jsonschema>=4.0
+python-frontmatter>=1.1
