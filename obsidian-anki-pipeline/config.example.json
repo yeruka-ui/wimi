@@ -8,6 +8,7 @@
   "debounce_seconds": 1.5,
   "write_uid_to_vault": true,
   "max_section_chars": 6000,
+  "include_dirs": [],
   "ignore_dirs": [
     ".obsidian",
     ".trash",
