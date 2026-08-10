@@ -8,43 +8,61 @@ from schema import CARD_SCHEMA, validate
 log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
-    "You turn study notes into Anki flashcards. You ONLY use information that is "
-    "explicitly written in the provided section body. You NEVER add outside knowledge.\n\n"
-    "HARD RULES — violating any of these means the card must be discarded:\n"
-    "1. Every answer must be a direct paraphrase or quote of text in the section body. "
-    "If the body does not state the answer, do NOT create the card.\n"
-    "2. Do NOT define acronyms, terms, or concepts unless the section body itself "
-    "defines them. Mentioning a term is NOT the same as defining it.\n"
-    "3. Do NOT use general world knowledge, even for things that seem obvious.\n"
-    "4. One card = one atomic fact. No compound questions.\n"
-    "5. NEVER produce two cards with the same or nearly-identical question. If a "
-    "section lists several items belonging to one category, produce ONE card asking "
-    "for the full list — do NOT create one card per list item with the same question.\n"
-    "6. Do NOT produce cards whose answer restates the question or is a single term "
-    "already in the question. Skip trivial or tautological cards.\n"
-    "7. If the section body is meta-commentary, a TODO list, a list of file names, "
-    "code without prose, or fewer than ~15 words of substantive content, "
-    "return {\"cards\": []}.\n"
-    "8. Focus on the LESSON, not the story. For narrative or biographical text, "
-    "extract only the general concepts, definitions, mechanisms, or rules being "
-    "taught. Do NOT create cards about the author's personal history, specific "
-    "people mentioned in passing, place names, dates, or anecdotal details unless "
-    "the note's core topic IS that biography/history. If in doubt, skip.\n"
-    "9. Output ONLY the JSON. No prose, no explanation, no markdown fences.\n\n"
-    "EXAMPLE of a BAD hallucination card (do not produce):\n"
-    "  Body: \"We call the local model via Ollama's API.\"\n"
-    "  BAD: Q=\"What does API stand for?\" A=\"Application Programming Interface\"\n"
-    "  Why bad: body mentions API but never defines it.\n\n"
-    "EXAMPLE of BAD list-splitting (do not produce):\n"
-    "  Body: \"Accuracy focuses on: Vocabulary, Pronunciation, Sentence Structure, "
-    "Rules of language.\"\n"
-    "  BAD: four cards all with Q=\"What does Accuracy focus on?\" and different answers.\n"
-    "  GOOD: ONE card, Q=\"What four things does Accuracy focus on?\" "
-    "A=\"Vocabulary, Pronunciation, Sentence Structure, and Rules of Language.\"\n\n"
-    "EXAMPLE of a GOOD paraphrase card:\n"
-    "  Body: \"The debouncer coalesces bursty events per-path into a single delayed callback.\"\n"
-    "  GOOD: Q=\"What does the debouncer do?\" "
-    "A=\"Coalesces bursty events per-path into a single delayed callback.\""
+    "You turn study notes into Anki flashcards. You ONLY use information written "
+    "in the section body. You NEVER add outside knowledge.\n\n"
+    "=== BANNED CARD PATTERNS — do NOT produce any card matching these ===\n"
+    "B1. Cards that mention 'the author', 'the writer', 'the note', 'the section', "
+    "'the text', or 'the passage'. Cards should not refer to the source, only its "
+    "content. If a card would need to say 'the author's X' to make sense, skip it.\n"
+    "B2. Cards whose answer is a proper noun (a person's name, place, country, "
+    "city, brand, product) UNLESS the entire note is a biography, history, or "
+    "geography of that entity. Example of banned: 'Where is X from? → Philippines'.\n"
+    "B3. Cards about anecdotes, personal history, dates, or 'when/where did X "
+    "happen' details from a narrative. Extract the general LESSON of the narrative "
+    "instead. Example of banned: 'What is the turning point in the story?'\n"
+    "B4. Cards where the question is (or nearly is) the note title or section "
+    "heading verbatim. Example of banned: heading 'What is taught is what is learnt' "
+    "→ Q='What is taught is what is learnt' — bad. Instead ask about the CLAIM the "
+    "heading makes.\n"
+    "B5. Cards that define acronyms, terms, or concepts NOT defined by the body. "
+    "Mentioning 'API' is not the same as defining it.\n"
+    "B6. Cards whose answer just repeats the substantive words in the question "
+    "('What comes naturally? → It comes naturally' is banned).\n"
+    "B7. Two or more cards with the same or near-same question. For a list of "
+    "items under one category, produce ONE card asking for the full list.\n"
+    "B8. Cards from general world knowledge, even for 'obvious' facts.\n\n"
+    "=== REQUIRED CARD SHAPE ===\n"
+    "R1. Every card must teach a general concept, definition, mechanism, rule, "
+    "categorization, or numeric fact that is stated in the section body.\n"
+    "R2. Every answer must be a direct paraphrase or quote of body text.\n"
+    "R3. One card = one atomic fact. No compound questions.\n"
+    "R4. If the section body has fewer than ~15 words of substantive content, or "
+    "is meta-commentary / TODOs / file names / raw code / narrative anecdote with "
+    "no clear lesson, return {\"cards\": []}.\n"
+    "R5. Output ONLY the JSON. No prose, no explanation, no markdown fences.\n\n"
+    "=== WORKED EXAMPLES ===\n"
+    "Body: \"Growing up in the Philippines, I studied Filipino throughout school "
+    "but by age 9 I still could not speak it fluently. That taught me a lesson: "
+    "what is TAUGHT is not necessarily what is LEARNED. Only about 20% of learning "
+    "comes from direct teaching; the other 80% comes from acquisition through use.\"\n"
+    "  BAD: Q='Where did the author grow up?' A='Philippines'  [B2, B3]\n"
+    "  BAD: Q='What is the author's native language?' A='Filipino'  [B1, B2]\n"
+    "  BAD: Q='What is the turning point in the author's story?'  [B1, B3]\n"
+    "  GOOD: Q='What percentage of learning comes from direct teaching vs. acquisition?' "
+    "A='About 20% from teaching, 80% from acquisition.'\n"
+    "  GOOD: Q='What is the lesson: what is TAUGHT is not necessarily what is what?' "
+    "A='LEARNED.'\n\n"
+    "Body: \"Accuracy focuses on Vocabulary, Pronunciation, Sentence Structure, "
+    "and Rules of Language.\"\n"
+    "  BAD: four separate cards all Q='What does Accuracy focus on?'  [B7]\n"
+    "  GOOD: ONE card Q='What four things does Accuracy focus on?' "
+    "A='Vocabulary, Pronunciation, Sentence Structure, and Rules of Language.'\n\n"
+    "Body: \"The debouncer coalesces bursty events per-path into a single delayed "
+    "callback.\"\n"
+    "  GOOD: Q='What does the debouncer do?' "
+    "A='Coalesces bursty events per-path into a single delayed callback.'\n\n"
+    "Body: \"We call the local model via Ollama's API.\"\n"
+    "  BAD: Q='What does API stand for?' A='Application Programming Interface'  [B5, B8]"
 )
 
 
@@ -103,8 +121,19 @@ def _is_echo(q, a):
     return inter / union >= 0.75
 
 
+_SELF_REF_PHRASES = (
+    "the author", "the writer", "the note", "the section", "the text",
+    "the passage", "the article", "the story", "the essay",
+)
+
+
+def _is_self_referential(q, a):
+    qa = f"{q} {a}".lower()
+    return any(p in qa for p in _SELF_REF_PHRASES)
+
+
 def _clean_cards(obj):
-    """Drop duplicate questions and tautological/echo cards. Mutates and returns obj."""
+    """Drop duplicate questions and tautological/echo/self-referential cards."""
     cards = obj.get("cards", [])
     seen_questions = set()
     kept = []
@@ -114,11 +143,11 @@ def _clean_cards(obj):
         if not q or not a:
             continue
         qn = _normalize(q)
-        # Drop dup questions (case/whitespace insensitive).
         if qn in seen_questions:
             continue
-        # Drop echoes: answer restates the substantive words of the question.
         if _is_echo(q, a):
+            continue
+        if _is_self_referential(q, a):
             continue
         seen_questions.add(qn)
         kept.append(c)
