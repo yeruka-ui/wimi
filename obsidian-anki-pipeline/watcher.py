@@ -136,7 +136,11 @@ def main():
     cfg = load_config("config.json")
     setup_logging(cfg["_log_dir"])
     log.info("Starting watcher on vault: %s", cfg["vault_path"])
-    log.info("Model: %s @ %s", cfg["ollama_model"], cfg["ollama_url"])
+    backend = (cfg.get("llm_backend") or "ollama").lower()
+    if backend == "groq":
+        log.info("Backend: groq / %s", cfg.get("groq_model", "llama-3.1-8b-instant"))
+    else:
+        log.info("Backend: ollama / %s @ %s", cfg["ollama_model"], cfg["ollama_url"])
 
     processor = Processor(cfg)
     initial_scan(cfg, processor)

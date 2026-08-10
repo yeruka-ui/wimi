@@ -5,8 +5,17 @@ from pathlib import Path
 import frontmatter
 
 import deck_builder
+import groq_client
 import ollama_client
 from markdown_parser import ensure_uid, note_folder, split_sections
+
+
+def _llm_for(cfg):
+    """Dispatch to the configured backend. Defaults to ollama for backwards compat."""
+    backend = (cfg.get("llm_backend") or "ollama").lower()
+    if backend == "groq":
+        return groq_client
+    return ollama_client
 from store import (
     append_flagged,
     card_guid,
@@ -114,7 +123,7 @@ class Processor:
             # Generate cards (may need to sub-split large sections)
             all_cards = []
             for chunk in _split_large(body, cfg["max_section_chars"]):
-                result = ollama_client.generate_cards(cfg, hp, chunk)
+                result = _llm_for(cfg).generate_cards(cfg, hp, chunk)
                 if result is None:
                     log.error("skipping section (LLM failed): %s :: %s", rel, hp)
                     # Do NOT update hash — retry on next save.
