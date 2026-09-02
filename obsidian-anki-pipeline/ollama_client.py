@@ -8,16 +8,29 @@ from schema import CARD_SCHEMA, validate
 log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
-    "You are an assistant that turns study notes into Anki flashcards. "
-    "Read the provided section (from an Obsidian note) and produce a set of "
-    "high-quality question/answer flashcards covering every important fact, "
-    "definition, or idea in the text — not just the heading. "
-    "Rules:\n"
-    "- One card = one atomic fact.\n"
-    "- Questions must be answerable from the section alone.\n"
-    "- Answers must be concise but self-contained.\n"
-    "- Skip meta-commentary, TODOs, and empty sections (return an empty cards array).\n"
-    "- Output ONLY valid JSON matching the required schema. No prose."
+    "You turn study notes into Anki flashcards. You ONLY use information that is "
+    "explicitly written in the provided section body. You NEVER add outside knowledge.\n\n"
+    "HARD RULES — violating any of these means the card must be discarded:\n"
+    "1. Every answer must be a direct paraphrase or quote of text in the section body. "
+    "If the body does not state the answer, do NOT create the card.\n"
+    "2. Do NOT define acronyms, terms, or concepts unless the section body itself "
+    "defines them. Mentioning a term is NOT the same as defining it.\n"
+    "3. Do NOT use general world knowledge, even for things that seem obvious.\n"
+    "4. One card = one atomic fact. No compound questions.\n"
+    "5. If the section body is meta-commentary, a TODO list, a list of file names, "
+    "code without prose, or otherwise not study material, return {\"cards\": []}.\n"
+    "6. Output ONLY the JSON. No prose, no explanation, no markdown fences.\n\n"
+    "EXAMPLE of a BAD card (do not produce):\n"
+    "  Section body: \"We call the local model via Ollama's API.\"\n"
+    "  BAD card: {\"question\": \"What does API stand for?\", "
+    "\"answer\": \"Application Programming Interface\"}\n"
+    "  Why it's bad: the body mentions \"API\" but never defines it. The answer "
+    "comes from outside knowledge.\n\n"
+    "EXAMPLE of a GOOD card:\n"
+    "  Section body: \"The debouncer coalesces bursty events per-path into a "
+    "single delayed callback.\"\n"
+    "  GOOD card: {\"question\": \"What does the debouncer do?\", "
+    "\"answer\": \"Coalesces bursty events per-path into a single delayed callback.\"}"
 )
 
 
@@ -25,8 +38,10 @@ def _build_user_prompt(heading_path, body):
     return (
         f"Section heading path: {heading_path}\n\n"
         f"Section body:\n\"\"\"\n{body}\n\"\"\"\n\n"
-        "Return JSON of the form {\"cards\": [{\"question\": \"...\", "
-        "\"answer\": \"...\", \"tags\": [\"...\"]}]}."
+        "Produce cards ONLY for facts stated directly in the section body above. "
+        "If the body defines nothing worth memorizing, return an empty cards array. "
+        "Return JSON of the form "
+        "{\"cards\": [{\"question\": \"...\", \"answer\": \"...\", \"tags\": [\"...\"]}]}."
     )
 
 
