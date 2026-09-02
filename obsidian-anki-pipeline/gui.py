@@ -1,14 +1,14 @@
 """
-Minimal Tkinter GUI for the Obsidian→Anki pipeline.
+Tkinter GUI for the Obsidian→Anki pipeline (on-demand mode).
 
-- Lists top-level folders in the vault.
-- Lets you check which folders to process and persists the choice to config.json.
-- Start/Stop buttons run watcher.py in a subprocess.
-- Tails logs/pipeline.log so you can see what's happening.
+Workflow: launch → pick a folder from the vault tree → Generate & export →
+Groq processes every .md under that folder (reusing cached hashes) → subset
+.apkg is written straight to the user-chosen path.
 """
 import json
+import logging
 import os
-import subprocess
+import re
 import sys
 import threading
 import time
@@ -21,14 +21,11 @@ DEFAULT_CONFIG = {
     "vault_path": "",
     "output_dir": "./",
     "deck_root_name": "Obsidian",
-    "ollama_url": "http://localhost:11434",
-    "ollama_model": "llama3.2:3b",
-    "ollama_timeout_seconds": 120,
-    "debounce_seconds": 1.5,
     "write_uid_to_vault": True,
     "max_section_chars": 6000,
-    "include_dirs": [],
-    "auto_start_watcher": True,
+    "llm_backend": "groq",
+    "groq_model": "llama-3.1-8b-instant",
+    "groq_timeout_seconds": 60,
     "ignore_dirs": [".obsidian", ".trash", ".git", "node_modules"],
 }
 
@@ -40,34 +37,22 @@ def _exe_dir():
 
 
 def _find_config():
-    """Search exe dir, then parent, then cwd for config.json. Returns first match or None."""
-    candidates = [
-        _exe_dir() / "config.json",
-        _exe_dir().parent / "config.json",
-        Path.cwd() / "config.json",
-    ]
-    for c in candidates:
+    for c in (_exe_dir() / "config.json",
+              _exe_dir().parent / "config.json",
+              Path.cwd() / "config.json"):
         if c.exists():
             return c
     return None
 
 
 def _app_dir():
-    """Directory where config.json (and thus logs/state/cards/deck) lives."""
     found = _find_config()
-    if found:
-        return found.parent
-    return _exe_dir()
+    return found.parent if found else _exe_dir()
 
 
 HERE = _app_dir()
 CONFIG_PATH = HERE / "config.json"
 LOG_PATH = HERE / "logs" / "pipeline.log"
-
-
-def load_config():
-    with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def save_config(cfg):
@@ -77,16 +62,35 @@ def save_config(cfg):
     os.replace(tmp, CONFIG_PATH)
 
 
-def list_top_level_folders(vault_path, ignore_dirs):
+def list_all_folders(vault_path, ignore_dirs):
+    """Recursively list every folder under the vault as (rel_posix_path, depth)."""
     vault = Path(vault_path)
     if not vault.exists():
         return []
     ignore = {d.lower() for d in ignore_dirs}
-    out = []
-    for p in sorted(vault.iterdir()):
-        if p.is_dir() and p.name.lower() not in ignore and not p.name.startswith("."):
-            out.append(p.name)
-    return out
+
+    def walk(dir_path, depth):
+        entries = []
+        try:
+            children = sorted(dir_path.iterdir(), key=lambda x: x.name.lower())
+        except OSError:
+            return entries
+        for p in children:
+            if not p.is_dir():
+                continue
+            if p.name.startswith(".") or p.name.lower() in ignore:
+                continue
+            rel = p.relative_to(vault).as_posix()
+            entries.append((rel, depth))
+            entries.extend(walk(p, depth + 1))
+        return entries
+
+    return walk(vault, 0)
+
+
+def _slugify(name):
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name.replace("::", "_")).strip("._-")
+    return slug or "deck"
 
 
 class App:
@@ -100,61 +104,17 @@ class App:
             root.destroy()
             return
 
-        self.proc = None
-        self.checkbox_vars = {}
+        self.selected_folder = tk.StringVar(value="")  # "" means whole vault
+        self._busy = False
 
         self._build_ui()
         self._refresh_folders()
         self._tail_thread = threading.Thread(target=self._tail_log, daemon=True)
         self._tail_thread.start()
-
-        # Auto-stop watcher when the window closes.
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Auto-start watcher on launch unless disabled in config.
-        if self.cfg.get("auto_start_watcher", True):
-            self.root.after(500, self._ensure_ollama_then_start)
-
-    def _ensure_ollama_then_start(self):
-        # Best-effort: launch the Ollama tray app if the server isn't reachable.
-        if not self._ollama_up():
-            self._try_launch_ollama()
-            # Give it a few seconds to come up; retry once.
-            self.root.after(4000, self._start)
-            return
-        self._start()
-
-    def _ollama_up(self):
-        try:
-            import urllib.request
-            url = self.cfg.get("ollama_url", "http://localhost:11434").rstrip("/") + "/api/tags"
-            with urllib.request.urlopen(url, timeout=1.5) as r:
-                return r.status == 200
-        except Exception:
-            return False
-
-    def _try_launch_ollama(self):
-        candidates = [
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama app.exe",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe",
-        ]
-        for exe in candidates:
-            if exe.exists():
-                try:
-                    subprocess.Popen([str(exe)], creationflags=subprocess.DETACHED_PROCESS if os.name == "nt" else 0)
-                    return True
-                except Exception:
-                    continue
-        return False
-
     def _on_close(self):
-        try:
-            if self.proc and self.proc.poll() is None:
-                self._stop()
-        finally:
-            self.root.destroy()
-
-    # --- config load / bootstrap -------------------------------------------
+        self.root.destroy()
 
     def _load_or_bootstrap_config(self):
         global HERE, CONFIG_PATH, LOG_PATH
@@ -170,13 +130,11 @@ class App:
                 messagebox.showerror("Config error", f"Could not read {found}:\n{e}")
                 return None
 
-        # No config anywhere — offer to create one.
-        choice = messagebox.askyesno(
+        if not messagebox.askyesno(
             "First-run setup",
             f"No config.json found next to the app.\n\n"
             f"Create one at:\n{_exe_dir() / 'config.json'}\n\nProceed?",
-        )
-        if not choice:
+        ):
             return None
         vault = filedialog.askdirectory(title="Select your Obsidian vault folder")
         if not vault:
@@ -196,21 +154,18 @@ class App:
         LOG_PATH = HERE / "logs" / "pipeline.log"
         return new_cfg
 
-    # --- UI construction ---------------------------------------------------
-
     def _build_ui(self):
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill="x")
-
         ttk.Label(top, text="Vault:").pack(side="left")
         self.vault_var = tk.StringVar(value=self.cfg.get("vault_path", ""))
         ttk.Entry(top, textvariable=self.vault_var, width=60).pack(side="left", padx=6)
-        ttk.Button(top, text="Refresh folders", command=self._refresh_folders).pack(side="left")
+        ttk.Button(top, text="Refresh", command=self._refresh_folders).pack(side="left")
 
         body = ttk.Frame(self.root, padding=8)
         body.pack(fill="both", expand=True)
 
-        left = ttk.LabelFrame(body, text="Folders to process (unchecked = ignored)", padding=6)
+        left = ttk.LabelFrame(body, text="Pick one folder (or leave blank for the whole vault)", padding=6)
         left.pack(side="left", fill="both", expand=True)
 
         self.folder_canvas = tk.Canvas(left, borderwidth=0, highlightthickness=0)
@@ -227,20 +182,13 @@ class App:
 
         right = ttk.Frame(body, padding=(8, 0))
         right.pack(side="left", fill="y")
-        ttk.Button(right, text="Select all", command=self._select_all).pack(fill="x", pady=2)
-        ttk.Button(right, text="Clear all", command=self._clear_all).pack(fill="x", pady=2)
+        self.gen_btn = ttk.Button(right, text="Generate && export…", command=self._generate_and_export)
+        self.gen_btn.pack(fill="x", pady=2)
         ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Button(right, text="Save selection", command=self._save_selection).pack(fill="x", pady=2)
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        self.start_btn = ttk.Button(right, text="Start watcher", command=self._start)
-        self.start_btn.pack(fill="x", pady=2)
-        self.stop_btn = ttk.Button(right, text="Stop watcher", command=self._stop, state="disabled")
-        self.stop_btn.pack(fill="x", pady=2)
-        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
-        self.status_var = tk.StringVar(value="Stopped")
-        ttk.Label(right, textvariable=self.status_var).pack(fill="x")
+        self.status_var = tk.StringVar(value="Idle")
+        ttk.Label(right, textvariable=self.status_var, wraplength=180).pack(fill="x")
 
-        log_frame = ttk.LabelFrame(self.root, text="Log (tail)", padding=6)
+        log_frame = ttk.LabelFrame(self.root, text="Log", padding=6)
         log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.log_text = tk.Text(log_frame, height=12, wrap="none", state="disabled")
         self.log_text.pack(fill="both", expand=True, side="left")
@@ -248,94 +196,135 @@ class App:
         yscroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=yscroll.set)
 
-    # --- folder list -------------------------------------------------------
-
     def _refresh_folders(self):
         for w in self.folder_inner.winfo_children():
             w.destroy()
-        self.checkbox_vars.clear()
 
         vault = self.vault_var.get().strip()
-        self.cfg["vault_path"] = vault  # keep in-memory copy in sync
-        folders = list_top_level_folders(vault, self.cfg.get("ignore_dirs", []))
-        selected = {d.lower() for d in self.cfg.get("include_dirs", [])}
+        self.cfg["vault_path"] = vault
+        folders = list_all_folders(vault, self.cfg.get("ignore_dirs", []))
+
+        ttk.Radiobutton(
+            self.folder_inner,
+            text="(whole vault)",
+            variable=self.selected_folder,
+            value="",
+        ).pack(anchor="w", pady=1)
 
         if not folders:
             ttk.Label(self.folder_inner, text="(no folders found)").pack(anchor="w")
             return
 
-        # If include_dirs is empty, treat all as selected visually.
-        default_all = not selected
-        for name in folders:
-            var = tk.BooleanVar(value=(default_all or name.lower() in selected))
-            cb = ttk.Checkbutton(self.folder_inner, text=name, variable=var)
-            cb.pack(anchor="w", pady=1)
-            self.checkbox_vars[name] = var
+        for rel, depth in folders:
+            label = ("    " * depth) + rel.rsplit("/", 1)[-1]
+            ttk.Radiobutton(
+                self.folder_inner,
+                text=label,
+                variable=self.selected_folder,
+                value=rel,
+            ).pack(anchor="w", pady=1)
 
-    def _select_all(self):
-        for v in self.checkbox_vars.values():
-            v.set(True)
-
-    def _clear_all(self):
-        for v in self.checkbox_vars.values():
-            v.set(False)
-
-    def _save_selection(self, silent=False):
-        checked = [n for n, v in self.checkbox_vars.items() if v.get()]
-        # If everything is checked, store empty list = "everything" (matches watcher semantics).
-        if len(checked) == len(self.checkbox_vars) and len(checked) > 0:
-            self.cfg["include_dirs"] = []
-        else:
-            self.cfg["include_dirs"] = checked
-        self.cfg["vault_path"] = self.vault_var.get().strip()
-        save_config(self.cfg)
-        if not silent:
-            messagebox.showinfo("Saved", f"include_dirs = {self.cfg['include_dirs']}")
-
-    # --- watcher control ---------------------------------------------------
-
-    def _start(self):
-        if self.proc and self.proc.poll() is None:
+    def _generate_and_export(self):
+        if self._busy:
             return
-        # Save first so the watcher picks up the current selection.
-        self._save_selection(silent=True)
+        rel_folder = self.selected_folder.get().strip()
+        vault = Path(self.cfg["vault_path"]).resolve()
+        if not vault.is_dir():
+            messagebox.showerror("Vault missing", f"Not a directory:\n{vault}")
+            return
+        scope_dir = vault / rel_folder if rel_folder else vault
+        if not scope_dir.is_dir():
+            messagebox.showerror("Folder missing", f"Not a directory:\n{scope_dir}")
+            return
+
+        md_files = self._collect_md_files(scope_dir)
+        if not md_files:
+            messagebox.showwarning("No notes", f"No .md files found under:\n{scope_dir}")
+            return
+
+        default_slug = _slugify(rel_folder or self.cfg.get("deck_root_name", "Obsidian"))
+        target = filedialog.asksaveasfilename(
+            title=f"Save deck: {rel_folder or '(whole vault)'}",
+            defaultextension=".apkg",
+            initialfile=f"{default_slug}.apkg",
+            filetypes=[("Anki deck", "*.apkg"), ("All files", "*.*")],
+        )
+        if not target:
+            return
+
+        self._set_busy(True, f"Generating {len(md_files)} note(s)…")
+        t = threading.Thread(
+            target=self._run_job,
+            args=(md_files, rel_folder, target),
+            daemon=True,
+        )
+        t.start()
+
+    def _collect_md_files(self, scope_dir):
+        ignore = {d.lower() for d in self.cfg.get("ignore_dirs", [])}
+        out = []
+        for root, dirs, files in os.walk(scope_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in ignore]
+            for name in files:
+                if name.lower().endswith(".md"):
+                    out.append(str(Path(root) / name))
+        return sorted(out)
+
+    def _run_job(self, md_files, rel_folder, target):
         try:
-            if getattr(sys, "frozen", False):
-                cmd = [sys.executable, "--watcher"]
+            import config as config_mod
+            import logging_setup
+            import processor as processor_mod
+            import deck_builder
+
+            os.chdir(str(HERE))
+            cfg = config_mod.load_config(str(CONFIG_PATH))
+            logging_setup.setup_logging(cfg["_log_dir"])
+            log = logging.getLogger("gui.job")
+            log.info("Generate & export: %d files under %s -> %s",
+                     len(md_files), rel_folder or "(whole vault)", target)
+
+            proc = processor_mod.Processor(cfg)
+            generated = 0
+            for i, path in enumerate(md_files, 1):
+                self._post_status(f"[{i}/{len(md_files)}] {Path(path).name}")
+                try:
+                    generated += proc.handle_upsert(path)
+                except Exception:
+                    log.exception("upsert failed: %s", path)
+
+            deck_root = cfg.get("deck_root_name", "Obsidian")
+            if rel_folder:
+                parts = [p for p in rel_folder.split("/") if p]
+                deck_prefix = "::".join([deck_root] + parts)
             else:
-                cmd = [sys.executable, str(HERE / "watcher.py")]
-            self.proc = subprocess.Popen(
-                cmd,
-                cwd=str(HERE),
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-            )
+                deck_prefix = deck_root
+
+            n_decks, n_cards = deck_builder.build_subset(proc.cards, deck_prefix, target)
+            log.info("Exported %d cards across %d sub-decks", n_cards, n_decks)
+            self._post_done(True,
+                            f"Done. {n_cards} cards in {n_decks} sub-deck(s).\nSaved to:\n{target}")
+        except ValueError as e:
+            self._post_done(False, f"Nothing to export.\n\n{e}")
         except Exception as e:
-            messagebox.showerror("Start failed", str(e))
-            return
-        self.status_var.set(f"Running (PID {self.proc.pid})")
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
+            logging.getLogger("gui.job").exception("job failed")
+            self._post_done(False, f"Failed:\n{e}")
 
-    def _stop(self):
-        if not self.proc or self.proc.poll() is not None:
-            self._on_stopped()
-            return
-        try:
-            if os.name == "nt":
-                self.proc.send_signal(subprocess.signal.CTRL_BREAK_EVENT)
-            else:
-                self.proc.terminate()
-            self.proc.wait(timeout=5)
-        except Exception:
-            self.proc.kill()
-        self._on_stopped()
+    def _post_status(self, text):
+        self.root.after(0, self.status_var.set, text)
 
-    def _on_stopped(self):
-        self.status_var.set("Stopped")
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
+    def _post_done(self, ok, msg):
+        def finish():
+            self._set_busy(False, "Idle")
+            (messagebox.showinfo if ok else messagebox.showwarning)(
+                "Export" if ok else "Export failed", msg
+            )
+        self.root.after(0, finish)
 
-    # --- log tail ----------------------------------------------------------
+    def _set_busy(self, busy, status_text):
+        self._busy = busy
+        self.status_var.set(status_text)
+        self.gen_btn.configure(state="disabled" if busy else "normal")
 
     def _tail_log(self):
         last_size = 0
@@ -343,7 +332,7 @@ class App:
             try:
                 if LOG_PATH.exists():
                     size = LOG_PATH.stat().st_size
-                    if size < last_size:  # rotated
+                    if size < last_size:
                         last_size = 0
                     if size > last_size:
                         with LOG_PATH.open("r", encoding="utf-8", errors="replace") as f:
@@ -352,9 +341,6 @@ class App:
                         last_size = size
                         if chunk:
                             self.root.after(0, self._append_log, chunk)
-                # detect subprocess exit
-                if self.proc and self.proc.poll() is not None:
-                    self.root.after(0, self._on_stopped)
             except Exception:
                 pass
             time.sleep(0.7)
@@ -362,7 +348,6 @@ class App:
     def _append_log(self, chunk):
         self.log_text.configure(state="normal")
         self.log_text.insert("end", chunk)
-        # cap the buffer so it doesn't grow unbounded
         line_count = int(self.log_text.index("end-1c").split(".")[0])
         if line_count > 2000:
             self.log_text.delete("1.0", f"{line_count - 1500}.0")
@@ -371,11 +356,6 @@ class App:
 
 
 def main():
-    # Dual-mode entry point: --watcher runs the watcher process, otherwise the GUI.
-    if "--watcher" in sys.argv[1:]:
-        import watcher  # local import so PyInstaller sees the dep
-        watcher.main()
-        return
     root = tk.Tk()
     App(root)
     root.mainloop()
