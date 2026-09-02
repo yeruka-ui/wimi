@@ -14,6 +14,7 @@ a = Analysis(
         'watcher',
         'processor',
         'ollama_client',
+        'groq_client',
         'markdown_parser',
         'deck_builder',
         'store',
