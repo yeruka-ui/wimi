@@ -25,7 +25,12 @@ SYSTEM_PROMPT = (
     "7. If the section body is meta-commentary, a TODO list, a list of file names, "
     "code without prose, or fewer than ~15 words of substantive content, "
     "return {\"cards\": []}.\n"
-    "8. Output ONLY the JSON. No prose, no explanation, no markdown fences.\n\n"
+    "8. Focus on the LESSON, not the story. For narrative or biographical text, "
+    "extract only the general concepts, definitions, mechanisms, or rules being "
+    "taught. Do NOT create cards about the author's personal history, specific "
+    "people mentioned in passing, place names, dates, or anecdotal details unless "
+    "the note's core topic IS that biography/history. If in doubt, skip.\n"
+    "9. Output ONLY the JSON. No prose, no explanation, no markdown fences.\n\n"
     "EXAMPLE of a BAD hallucination card (do not produce):\n"
     "  Body: \"We call the local model via Ollama's API.\"\n"
     "  BAD: Q=\"What does API stand for?\" A=\"Application Programming Interface\"\n"
@@ -66,12 +71,40 @@ def _grammar_safe(schema):
     return schema
 
 
+_STOPWORDS = {
+    "the","a","an","is","are","was","were","be","been","being","of","to","in",
+    "on","at","for","and","or","but","that","this","these","those","it","its",
+    "as","by","with","from","what","who","when","where","why","how","which",
+    "does","do","did","has","have","had","can","could","would","should","may",
+    "might","will","shall","if","then","than","so","because","about",
+}
+
+
 def _normalize(s):
     return " ".join(s.lower().split())
 
 
+def _content_words(s):
+    return {w.strip(".,;:!?'\"()[]") for w in _normalize(s).split() if w not in _STOPWORDS and len(w) > 2}
+
+
+def _is_echo(q, a):
+    """True if the answer just repeats the substantive words of the question."""
+    aw = _content_words(a)
+    qw = _content_words(q)
+    if not aw:
+        return True
+    # Answer content-words are a subset of the question's — nothing new.
+    if aw.issubset(qw):
+        return True
+    # Jaccard overlap is very high.
+    inter = len(aw & qw)
+    union = len(aw | qw) or 1
+    return inter / union >= 0.75
+
+
 def _clean_cards(obj):
-    """Drop duplicate questions and tautological cards. Mutates and returns obj."""
+    """Drop duplicate questions and tautological/echo cards. Mutates and returns obj."""
     cards = obj.get("cards", [])
     seen_questions = set()
     kept = []
@@ -81,15 +114,11 @@ def _clean_cards(obj):
         if not q or not a:
             continue
         qn = _normalize(q)
-        an = _normalize(a)
         # Drop dup questions (case/whitespace insensitive).
         if qn in seen_questions:
             continue
-        # Drop tautologies: answer is a substring of the question, or vice versa,
-        # or answer is a single word already present in the question.
-        if an == qn or an in qn:
-            continue
-        if len(an.split()) <= 2 and an in qn:
+        # Drop echoes: answer restates the substantive words of the question.
+        if _is_echo(q, a):
             continue
         seen_questions.add(qn)
         kept.append(c)
