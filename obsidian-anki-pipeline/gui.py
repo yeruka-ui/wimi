@@ -14,14 +14,50 @@ import threading
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
-def _app_dir():
-    """Directory containing config.json / logs — differs when frozen by PyInstaller."""
+DEFAULT_CONFIG = {
+    "vault_path": "",
+    "output_dir": "./",
+    "deck_root_name": "Obsidian",
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "llama3.2:3b",
+    "ollama_timeout_seconds": 120,
+    "debounce_seconds": 1.5,
+    "write_uid_to_vault": True,
+    "max_section_chars": 6000,
+    "include_dirs": [],
+    "auto_start_watcher": True,
+    "ignore_dirs": [".obsidian", ".trash", ".git", "node_modules"],
+}
+
+
+def _exe_dir():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def _find_config():
+    """Search exe dir, then parent, then cwd for config.json. Returns first match or None."""
+    candidates = [
+        _exe_dir() / "config.json",
+        _exe_dir().parent / "config.json",
+        Path.cwd() / "config.json",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _app_dir():
+    """Directory where config.json (and thus logs/state/cards/deck) lives."""
+    found = _find_config()
+    if found:
+        return found.parent
+    return _exe_dir()
 
 
 HERE = _app_dir()
@@ -59,10 +95,8 @@ class App:
         self.root.title("Wimi — Obsidian → Anki")
         self.root.geometry("780x560")
 
-        try:
-            self.cfg = load_config()
-        except Exception as e:
-            messagebox.showerror("Config error", f"Could not read {CONFIG_PATH}:\n{e}")
+        self.cfg = self._load_or_bootstrap_config()
+        if self.cfg is None:
             root.destroy()
             return
 
@@ -73,6 +107,94 @@ class App:
         self._refresh_folders()
         self._tail_thread = threading.Thread(target=self._tail_log, daemon=True)
         self._tail_thread.start()
+
+        # Auto-stop watcher when the window closes.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Auto-start watcher on launch unless disabled in config.
+        if self.cfg.get("auto_start_watcher", True):
+            self.root.after(500, self._ensure_ollama_then_start)
+
+    def _ensure_ollama_then_start(self):
+        # Best-effort: launch the Ollama tray app if the server isn't reachable.
+        if not self._ollama_up():
+            self._try_launch_ollama()
+            # Give it a few seconds to come up; retry once.
+            self.root.after(4000, self._start)
+            return
+        self._start()
+
+    def _ollama_up(self):
+        try:
+            import urllib.request
+            url = self.cfg.get("ollama_url", "http://localhost:11434").rstrip("/") + "/api/tags"
+            with urllib.request.urlopen(url, timeout=1.5) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def _try_launch_ollama(self):
+        candidates = [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama app.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe",
+        ]
+        for exe in candidates:
+            if exe.exists():
+                try:
+                    subprocess.Popen([str(exe)], creationflags=subprocess.DETACHED_PROCESS if os.name == "nt" else 0)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    def _on_close(self):
+        try:
+            if self.proc and self.proc.poll() is None:
+                self._stop()
+        finally:
+            self.root.destroy()
+
+    # --- config load / bootstrap -------------------------------------------
+
+    def _load_or_bootstrap_config(self):
+        global HERE, CONFIG_PATH, LOG_PATH
+        found = _find_config()
+        if found:
+            HERE = found.parent
+            CONFIG_PATH = found
+            LOG_PATH = HERE / "logs" / "pipeline.log"
+            try:
+                with found.open("r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                messagebox.showerror("Config error", f"Could not read {found}:\n{e}")
+                return None
+
+        # No config anywhere — offer to create one.
+        choice = messagebox.askyesno(
+            "First-run setup",
+            f"No config.json found next to the app.\n\n"
+            f"Create one at:\n{_exe_dir() / 'config.json'}\n\nProceed?",
+        )
+        if not choice:
+            return None
+        vault = filedialog.askdirectory(title="Select your Obsidian vault folder")
+        if not vault:
+            messagebox.showinfo("Cancelled", "No vault selected — cannot start.")
+            return None
+        new_cfg = dict(DEFAULT_CONFIG)
+        new_cfg["vault_path"] = vault
+        target = _exe_dir() / "config.json"
+        try:
+            with target.open("w", encoding="utf-8") as f:
+                json.dump(new_cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            messagebox.showerror("Write failed", str(e))
+            return None
+        HERE = target.parent
+        CONFIG_PATH = target
+        LOG_PATH = HERE / "logs" / "pipeline.log"
+        return new_cfg
 
     # --- UI construction ---------------------------------------------------
 
@@ -158,7 +280,7 @@ class App:
         for v in self.checkbox_vars.values():
             v.set(False)
 
-    def _save_selection(self):
+    def _save_selection(self, silent=False):
         checked = [n for n, v in self.checkbox_vars.items() if v.get()]
         # If everything is checked, store empty list = "everything" (matches watcher semantics).
         if len(checked) == len(self.checkbox_vars) and len(checked) > 0:
@@ -167,7 +289,8 @@ class App:
             self.cfg["include_dirs"] = checked
         self.cfg["vault_path"] = self.vault_var.get().strip()
         save_config(self.cfg)
-        messagebox.showinfo("Saved", f"include_dirs = {self.cfg['include_dirs']}")
+        if not silent:
+            messagebox.showinfo("Saved", f"include_dirs = {self.cfg['include_dirs']}")
 
     # --- watcher control ---------------------------------------------------
 
@@ -175,7 +298,7 @@ class App:
         if self.proc and self.proc.poll() is None:
             return
         # Save first so the watcher picks up the current selection.
-        self._save_selection()
+        self._save_selection(silent=True)
         try:
             if getattr(sys, "frozen", False):
                 cmd = [sys.executable, "--watcher"]
@@ -258,5 +381,20 @@ def main():
     root.mainloop()
 
 
+def _write_crashlog(exc):
+    import traceback
+    try:
+        path = _app_dir() / "crash.log"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(f"\n----- {time.strftime('%Y-%m-%d %H:%M:%S')} -----\n")
+            f.write("".join(traceback.format_exception(exc)))
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        _write_crashlog(e)
+        raise
