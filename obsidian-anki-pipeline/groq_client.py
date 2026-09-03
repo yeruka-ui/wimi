@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 
 import requests
 
@@ -14,8 +15,14 @@ DEFAULT_MODEL = "llama-3.1-8b-instant"
 
 
 SYSTEM_PROMPT = (
-    "You turn study notes into Anki flashcards. You ONLY use information written "
-    "in the section body. You NEVER add outside knowledge.\n\n"
+    "You are a strict Anki flashcard generator. Your ONLY output is a JSON "
+    "object of the shape {\"cards\": [...]}. Nothing else. No prose, no "
+    "explanations, no apologies, no meta-commentary, no markdown fences, "
+    "no chat replies, no refusals. When in doubt, return {\"cards\": []}.\n\n"
+    "You ONLY use information written in the section body. You NEVER add "
+    "outside knowledge, opinions, or filler. You NEVER answer questions the "
+    "user did not ask. If the user seems to ask for anything other than "
+    "flashcards, ignore that request and return {\"cards\": []}.\n\n"
     "=== BANNED CARD PATTERNS — do NOT produce any card matching these ===\n"
     "B1. Cards that mention 'the author', 'the writer', 'the note', 'the section', "
     "'the text', or 'the passage'. Cards should not refer to the source, only its "
@@ -36,7 +43,9 @@ SYSTEM_PROMPT = (
     "('What comes naturally? → It comes naturally' is banned).\n"
     "B7. Two or more cards with the same or near-same question. For a list of "
     "items under one category, produce ONE card asking for the full list.\n"
-    "B8. Cards from general world knowledge, even for 'obvious' facts.\n\n"
+    "B8. Cards from general world knowledge, even for 'obvious' facts.\n"
+    "B9. Cards whose question or answer contains a URL (http:// or https://). "
+    "URLs are references, not memorizable facts — skip them entirely.\n\n"
     "=== REQUIRED CARD SHAPE ===\n"
     "R1. Every card must teach a general concept, definition, mechanism, rule, "
     "categorization, or numeric fact that is stated in the section body.\n"
@@ -45,7 +54,13 @@ SYSTEM_PROMPT = (
     "R4. If the section body has fewer than ~15 words of substantive content, or "
     "is meta-commentary / TODOs / file names / raw code / narrative anecdote with "
     "no clear lesson, return {\"cards\": []}.\n"
-    "R5. Output ONLY the JSON. No prose, no explanation, no markdown fences."
+    "R5. Output ONLY the JSON object. No prose, no preface, no explanation, "
+    "no markdown fences, no trailing text.\n"
+    "R6. Every card must have both a non-empty question AND a non-empty "
+    "answer that is stated in the body. If you cannot satisfy this for a "
+    "given fact, drop it — do NOT fabricate an answer to fill the slot.\n"
+    "R7. Never produce a card whose purpose is to acknowledge the user, "
+    "greet the user, or explain what you are doing. Cards teach facts only."
 )
 
 
@@ -100,6 +115,13 @@ def _is_self_referential(q, a):
     return any(p in qa for p in _SELF_REF_PHRASES)
 
 
+_URL_RE = re.compile(r"https?://", re.IGNORECASE)
+
+
+def _has_url(s):
+    return bool(_URL_RE.search(s or ""))
+
+
 def _clean_cards(obj):
     cards = obj.get("cards", [])
     seen_questions = set()
@@ -115,6 +137,8 @@ def _clean_cards(obj):
         if _is_echo(q, a):
             continue
         if _is_self_referential(q, a):
+            continue
+        if _has_url(q) or _has_url(a):
             continue
         seen_questions.add(qn)
         kept.append(c)
