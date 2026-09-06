@@ -5,6 +5,7 @@ from pathlib import Path
 import frontmatter
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 
 def _read(path):
@@ -43,7 +44,9 @@ def ensure_uid(path, write_back=True):
     if not text.lstrip().startswith("---"):
         new_text = f"---\nuid: {new_uid}\n---\n" + text
     else:
-        new_text = frontmatter.dumps(post) + ("\n" if not text.endswith("\n") else "")
+        new_text = frontmatter.dumps(post)
+        if not new_text.endswith("\n"):
+            new_text += "\n"
     _write(path, new_text)
     return new_uid, True
 
@@ -74,8 +77,13 @@ def split_sections(body_text):
                 "body": text,
             })
 
+    in_fence = False
     for line in lines:
-        m = HEADING_RE.match(line)
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            buf.append(line)
+            continue
+        m = None if in_fence else HEADING_RE.match(line)
         if m:
             flush()
             buf = []

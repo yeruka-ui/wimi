@@ -14,6 +14,11 @@ obsidian-anki-pipeline/logs/
 # Local config (contains machine-specific vault path)
 obsidian-anki-pipeline/config.json
 
+# PyInstaller build artifacts
+obsidian-anki-pipeline/build/
+obsidian-anki-pipeline/dist/
+obsidian-anki-pipeline/*.spec.bak
+
 # OS
 .DS_Store
 Thumbs.db
