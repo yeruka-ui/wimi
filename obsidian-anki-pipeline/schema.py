@@ -12,7 +12,7 @@ CARD_SCHEMA = {
             "items": {
                 "type": "object",
                 "required": ["question", "answer"],
-                "additionalProperties": False,
+                "additionalProperties": True,
                 "properties": {
                     "question": {"type": "string", "minLength": 3, "maxLength": 500},
                     "answer": {"type": "string", "minLength": 1, "maxLength": 2000},

@@ -30,17 +30,25 @@ def _rel_posix(vault, path):
 
 
 def _split_large(body, max_chars):
-    """Sub-split a too-large section by paragraph to stay under token budget."""
+    """Sub-split a too-large section by paragraph to stay under token budget.
+    Any single paragraph exceeding max_chars is hard-split on character count
+    so we never hand an oversized chunk to the LLM."""
     if len(body) <= max_chars:
         return [body]
+
+    def _hard_split(text, limit):
+        return [text[i:i + limit] for i in range(0, len(text), limit)]
+
     chunks, buf, size = [], [], 0
     for para in body.split("\n\n"):
-        p = para + "\n\n"
-        if size + len(p) > max_chars and buf:
-            chunks.append("".join(buf).strip())
-            buf, size = [], 0
-        buf.append(p)
-        size += len(p)
+        pieces = _hard_split(para, max_chars) if len(para) > max_chars else [para]
+        for piece in pieces:
+            p = piece + "\n\n"
+            if size + len(p) > max_chars and buf:
+                chunks.append("".join(buf).strip())
+                buf, size = [], 0
+            buf.append(p)
+            size += len(p)
     if buf:
         chunks.append("".join(buf).strip())
     return [c for c in chunks if c]
@@ -134,9 +142,12 @@ class Processor:
             self._soft_delete_section(uid, gone, reason="section removed from note")
 
         for guid in list(self._by_uid.get(uid, set())):
-            if self.cards[guid].get("deck") != deck and self.cards[guid]["status"] == "active":
-                self.cards[guid]["deck"] = deck
-                self.cards[guid]["updated_at"] = _now()
+            card = self.cards.get(guid)
+            if not card:
+                continue
+            if card.get("status") == "active" and card.get("deck") != deck:
+                card["deck"] = deck
+                card["updated_at"] = _now()
 
         note_state["sections"] = new_hashes
         self.state[uid] = note_state
@@ -156,13 +167,17 @@ class Processor:
         for i, card in enumerate(new_card_list):
             guid = card_guid(uid, heading_path, i)
             kept_guids.add(guid)
-            content_hash = sha256_text(card["question"] + "\n" + card["answer"])
+            tags = list(card.get("tags", []))
+            content_hash = sha256_text(
+                card["question"] + "\n" + card["answer"] + "\n"
+                + "\t".join(sorted(str(t) for t in tags))
+            )
             prev = self.cards.get(guid)
             entry = {
                 "guid": guid,
                 "question": card["question"],
                 "answer": card["answer"],
-                "tags": card.get("tags", []),
+                "tags": tags,
                 "note_uid": uid,
                 "heading_path": heading_path,
                 "ordinal": i,

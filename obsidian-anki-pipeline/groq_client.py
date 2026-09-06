@@ -2,7 +2,9 @@
 import json
 import logging
 import os
+import random
 import re
+import time
 
 import requests
 
@@ -146,6 +148,12 @@ def _clean_cards(obj):
     return obj
 
 
+class _RateLimited(Exception):
+    def __init__(self, wait_seconds):
+        super().__init__(f"rate-limited, wait {wait_seconds:.1f}s")
+        self.wait_seconds = wait_seconds
+
+
 def _get_api_key(cfg):
     key = cfg.get("groq_api_key") or os.environ.get("GROQ_API") or os.environ.get("GROQ_API_KEY")
     if not key:
@@ -156,17 +164,28 @@ def _get_api_key(cfg):
     return key
 
 
-def _call_once(cfg, heading_path, body):
+def _call_once(cfg, heading_path, body, attempt=1):
     api_key = _get_api_key(cfg)
     url = cfg.get("groq_url", DEFAULT_URL)
     model = cfg.get("groq_model", DEFAULT_MODEL)
+    # Nudge the second attempt with a slightly higher temperature and a
+    # reminder appended to the user prompt so we don't repeat a deterministic
+    # failure verbatim.
+    temperature = 0.2 if attempt == 1 else 0.4
+    user_prompt = _build_user_prompt(heading_path, body)
+    if attempt > 1:
+        user_prompt += (
+            "\n\nREMINDER: Return ONLY a JSON object of the form "
+            "{\"cards\": [...]}. If nothing in the body is worth memorizing, "
+            "return {\"cards\": []}. No prose, no fences."
+        )
     payload = {
         "model": model,
-        "temperature": 0.2,
+        "temperature": temperature,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(heading_path, body)},
+            {"role": "user", "content": user_prompt},
         ],
     }
     headers = {
@@ -175,6 +194,14 @@ def _call_once(cfg, heading_path, body):
     }
     r = requests.post(url, json=payload, headers=headers,
                       timeout=cfg.get("groq_timeout_seconds", 60))
+    # Honor Retry-After on 429 so the second attempt actually has a chance.
+    if r.status_code == 429:
+        retry_after = r.headers.get("Retry-After")
+        try:
+            wait = float(retry_after) if retry_after else 2.0
+        except ValueError:
+            wait = 2.0
+        raise _RateLimited(min(wait, 30.0))
     r.raise_for_status()
     data = r.json()
     content = data["choices"][0]["message"]["content"].strip()
@@ -191,12 +218,28 @@ def _call_once(cfg, heading_path, body):
 
 
 def generate_cards(cfg, heading_path, body):
-    try:
-        return _call_once(cfg, heading_path, body)
-    except Exception as e:
-        log.warning("Groq attempt 1 failed for %s: %s", heading_path, e)
-    try:
-        return _call_once(cfg, heading_path, body)
-    except Exception as e:
-        log.error("Groq attempt 2 failed for %s: %s — skipping", heading_path, e)
-        return None
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _call_once(cfg, heading_path, body, attempt=attempt)
+        except _RateLimited as e:
+            log.warning("Groq rate-limited on %s (attempt %d): sleeping %.1fs",
+                        heading_path, attempt, e.wait_seconds)
+            if attempt < max_attempts:
+                time.sleep(e.wait_seconds + random.uniform(0, 0.5))
+            else:
+                log.error("Groq gave up on %s after %d attempts (rate limit)",
+                          heading_path, max_attempts)
+                return None
+        except Exception as e:
+            log.warning("Groq attempt %d failed for %s: %s",
+                        attempt, heading_path, e)
+            if attempt < max_attempts:
+                # Small jittered backoff so a transient 5xx or parse error
+                # isn't retried at the same instant.
+                time.sleep(0.75 + random.uniform(0, 0.75))
+            else:
+                log.error("Groq gave up on %s after %d attempts — skipping",
+                          heading_path, max_attempts)
+                return None
+    return None

@@ -74,21 +74,16 @@ def list_deck_tree(cards):
             continue
         direct[c["deck"]] = direct.get(c["deck"], 0) + 1
 
-    all_names = set()
-    for name in direct:
+    total = {}
+    for name, count in direct.items():
         parts = name.split("::")
         for i in range(1, len(parts) + 1):
-            all_names.add("::".join(parts[:i]))
-
-    total = {}
-    for anc in all_names:
-        prefix = anc + "::"
-        total[anc] = sum(n for d, n in direct.items()
-                         if d == anc or d.startswith(prefix))
+            anc = "::".join(parts[:i])
+            total[anc] = total.get(anc, 0) + count
 
     return [
         (name, name.count("::"), direct.get(name, 0), total[name])
-        for name in sorted(all_names)
+        for name in sorted(total)
     ]
 
 

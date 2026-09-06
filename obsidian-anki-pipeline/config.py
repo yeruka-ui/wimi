@@ -18,6 +18,7 @@ DEFAULTS = {
 def load_config(path="config.json"):
     cfg = dict(DEFAULTS)
     p = Path(path)
+    config_dir = p.resolve().parent if p.exists() else Path.cwd()
     if p.exists():
         with p.open("r", encoding="utf-8") as f:
             cfg.update(json.load(f))
@@ -26,7 +27,12 @@ def load_config(path="config.json"):
         raise SystemExit(
             f"config.json: vault_path is missing or not a directory: {vault!r}"
         )
-    out = Path(cfg["output_dir"]).resolve()
+    # Resolve output_dir relative to the config file, not the process cwd,
+    # so state/cards/logs land next to config.json regardless of where the
+    # app was launched from.
+    out_raw = Path(cfg["output_dir"])
+    out = out_raw if out_raw.is_absolute() else (config_dir / out_raw)
+    out = out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     cfg["output_dir"] = str(out)
     cfg["_state_path"] = str(out / "state.json")

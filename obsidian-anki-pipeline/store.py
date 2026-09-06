@@ -1,7 +1,12 @@
 import hashlib
 import json
+import logging
 import os
+import shutil
+import time
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 def _load_json(path, default):
@@ -11,8 +16,18 @@ def _load_json(path, default):
     try:
         with p.open("r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
-        return default
+    except (OSError, json.JSONDecodeError) as e:
+        # Preserve the corrupt file so nothing gets silently overwritten.
+        backup = p.with_suffix(p.suffix + f".corrupt-{int(time.time())}")
+        try:
+            shutil.copy2(p, backup)
+        except OSError:
+            backup = None
+        raise RuntimeError(
+            f"Refusing to load {p}: file is unreadable/corrupt ({e}). "
+            f"{'Backup saved to ' + str(backup) + '. ' if backup else ''}"
+            f"Fix or delete the file before rerunning."
+        ) from e
 
 
 def _save_json_atomic(path, obj):

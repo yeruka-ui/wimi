@@ -277,7 +277,6 @@ class App:
             import processor as processor_mod
             import deck_builder
 
-            os.chdir(str(HERE))
             cfg = config_mod.load_config(str(CONFIG_PATH))
             logging_setup.setup_logging(cfg["_log_dir"])
             log = logging.getLogger("gui.job")
